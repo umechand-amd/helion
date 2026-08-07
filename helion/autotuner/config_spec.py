@@ -429,6 +429,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | {
         "num_threads",
         "cute_vector_widths",
+        "constexpr_range",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
@@ -465,6 +466,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_load_buffer_count",
         "pallas_pre_broadcast",
         "cute_vector_widths",
+        # FlyDSL: emit range_constexpr for small reduction tile counts so the
+        # loaded input vectors can be register-cached across two passes (2-read HBM).
+        "constexpr_range",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
@@ -2499,6 +2503,13 @@ class ConfigSpec:
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_pre_broadcast"):
                 fields["pallas_pre_broadcast"] = BooleanFragment()
+        # FlyDSL register-caching: emit range_constexpr (in_local[] pattern, 2-read
+        # HBM) when the tile count is small enough.  Registering as a BooleanFragment
+        # lets the beam-search neighbor generator flip it True↔False so autotune can
+        # reliably discover the faster variant rather than depending on whether the
+        # initial candidate list happened to include a constexpr_range=True entry.
+        if self.supports_config_key("constexpr_range"):
+            fields["constexpr_range"] = BooleanFragment()
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             fields["maxnreg"] = EnumFragment(VALID_MAXNREG)
@@ -2896,14 +2907,15 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # left byte-identical).
         if isinstance(normalized, int) and normalized < 2:
             normalized = 8
-        # A looped reduction whose chunk exactly equals the reduction extent has
-        # only one iteration — semantically identical to a persistent reduction.
-        # Collapse to None to match ``_flat_config`` and avoid CuTe-backend
-        # codegen differences (e.g. multi-pass layer_norm).  Chunks *strictly
-        # greater* than size_hint are left as-is so that backends like FlyDSL
-        # can detect the out-of-bounds condition in pre_codegen and raise an
-        # appropriate error rather than silently falling back to persistent.
-        if isinstance(normalized, int) and normalized == self.size_hint:
+        # A looped reduction whose chunk equals or exceeds the reduction
+        # extent has only one iteration — it is semantically identical to a
+        # persistent reduction, but the looped codegen path occasionally
+        # produces subtly different results on the CuTe backend (e.g. when a
+        # multi-pass kernel like layer_norm reuses the loaded inputs across
+        # two reductions).  Collapsing to ``None`` here matches the
+        # ``_flat_config`` behaviour and keeps the persistent/loop choice in
+        # sync regardless of how the value was generated.
+        if isinstance(normalized, int) and normalized >= self.size_hint:
             return None
         return normalized
 
