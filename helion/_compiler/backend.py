@@ -3292,10 +3292,18 @@ class FlyDSLBackend(Backend):
         return f"fx.block_idx.{'xyz'[dim]}"
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
-        # W=1: bm warps, one warp per row. block = 64*bm threads.
+        # Threads per block depends on the regime (see pre_codegen):
+        #   W=1 [bm,256]:  block = 64*bm  (bm warps, one warp per row)
+        #   W>1 [1,W*256]: block = 64*W   (W warps cooperate on one row)
+        # AMD caps a workgroup at 1024 threads.
         bs = config.block_sizes
         bm = int(bs[0])
-        n_threads = 64 * bm
+        bn = int(bs[-1]) if len(bs) >= 2 else 256
+        n_threads = 64 * (bn // 256) if (bm == 1 and bn > 256) else 64 * bm
+        # Whole-row looped reduction: threads = thread_count from (chunk, V).
+        _tc = self._flydsl_looped_thread_count(config, bm)
+        if _tc is not None:
+            n_threads = _tc
         if n_threads > 1024:
             raise exc.BackendUnsupported(
                 self.name, f"block too large: {n_threads} threads"
@@ -3459,19 +3467,19 @@ class FlyDSLBackend(Backend):
             if not rl_ids:
                 continue
             if bm == 1:
-                # bm==1: one row, one wavefront (W=1). chunk = 64*V (single warp).
-                # Only V=4 (fp32/fp16) for W=1; fp16 V=8 added in PR2.
-                c = 64 * 4  # W=1, V=4: chunk=256
-                if c <= _hi_loop:
-                    _add(bs, c, 4)
-                if 8 in _v_choices:
-                    c8 = 64 * 8  # W=1, V=8 (fp16 only): chunk=512
-                    if c8 <= _hi_loop:
-                        _add(bs, c8, 8)
+                # bm==1: one row may span W wavefronts. thread_count = chunk // V,
+                # W = thread_count // 64 (<=16). Enumerate (chunk, V): chunk from
+                # 64*V (W=1) up to 1024*V (W=16), V in {4} (+8 for fp16).
+                for v in _v_choices:
+                    c = 64 * v
+                    while c <= _hi_loop and (c // v) <= 1024:
+                        _add(bs, c, v)
+                        c *= 2
             else:
                 # bm>1: one warp/row (thread_count 64), V = chunk // 64 derived
-                # from the chunk. Offer chunk = 64*V for V in {1,2,4}.
-                for v in sorted({1, 2, 4}):
+                # from the chunk. Offer chunk = 64*V for V in {1,2,4} (+8 fp16).
+                _bm_vs = {1, 2, 4} | ({8} if 8 in _v_choices else set())
+                for v in sorted(_bm_vs):
                     c = 64 * v
                     if c <= _hi_loop:
                         _add(bs, c, None)
@@ -3599,6 +3607,7 @@ class FlyDSLBackend(Backend):
         self._flydsl_helpers_emitted = False
         bs = getattr(config, "block_sizes", None) or [1]
         bm = int(bs[0]) if bs else 1
+        bn = int(bs[-1]) if len(bs) >= 2 else 256
 
         # Guard: for user-tiled (explicit hl.tile(n)) reductions every column
         # block size must be a multiple of 256 (= V*64 = one warp-pass width).
@@ -3621,10 +3630,15 @@ class FlyDSLBackend(Backend):
                     f"multiple of 256 (got block_sizes={list(bs)})",
                 )
 
-        # W=1 only: one warp per row.
-        self._flydsl_warps_per_row = 1
+        W = bn // 256 if (bm == 1 and bn > 256 and bn % 256 == 0) else 1
+        # Whole-row looped reduction: W = thread_count // 64 from (chunk, V).
+        _tc = self._flydsl_looped_thread_count(config, bm)
+        if _tc is not None:
+            W = _tc // 64
+
+        self._flydsl_warps_per_row = W
         self._flydsl_bm = bm
-        self._flydsl_num_threads = 64 * bm
+        self._flydsl_num_threads = 64 * W if W > 1 else 64 * bm
         self._tensor_use_buffer: dict[int, bool] = {}
         self._tensor_vec_width: dict[int, int] = {}
 
@@ -3653,6 +3667,9 @@ class FlyDSLBackend(Backend):
         # Row (grid) tile -> warps. A block holds bm rows as bm warps; warp
         # w = thread_idx.x // 64 owns row (block_idx.x * bm + w). Force dim x
         # (flat block) regardless of the axis Helion assigns.
+        # W>1 regime is one row per block (bm=1) -> row = block_idx.x, no warp offset.
+        if getattr(self, "_flydsl_warps_per_row", 1) > 1:
+            return offset_var
         if block_size_var == "1":
             return offset_var
         return f"({offset_var}) + fx.thread_idx.x // 64"
@@ -3662,8 +3679,11 @@ class FlyDSLBackend(Backend):
     ) -> str:
         # Column (loop) tile -> lanes. chunk = col_offset//vec + lane_id.
         # W=1: lane_id = thread_idx.x % 64 (one warp/row).
+        # W>1: W*64 lanes cover one row -> lane_id = full thread_idx.x (no % 64).
         if block_size_var == "1":
             return offset_var
+        if getattr(self, "_flydsl_warps_per_row", 1) > 1:
+            return f"({offset_var}) // 4 + fx.thread_idx.x"
         return f"({offset_var}) // 4 + fx.thread_idx.x % 64"
 
     def arange_expr(
@@ -3675,7 +3695,10 @@ class FlyDSLBackend(Backend):
         *,
         axis: int = 0,
     ) -> str:
-        # Column lane chunk: element_offset//vec + lane_id (W=1: one warp/row).
+        # Column lane chunk: element_offset//vec + lane_id.
+        # W>1 uses the full thread id (W*64 lanes/row); W=1 uses thread_idx.x % 64.
+        if getattr(self, "_flydsl_warps_per_row", 1) > 1:
+            return f"{offsets_var} = ({lid}) // 4 + fx.thread_idx.x"
         return f"{offsets_var} = ({lid}) // 4 + fx.thread_idx.x % 64"
 
     def range_str(self, begin: str | None, end: str, step: str | None) -> str | None:
@@ -3689,7 +3712,9 @@ class FlyDSLBackend(Backend):
     def thread_in_tile_mask_expr(
         self, block_size_var: str, *, axis: int = 0
     ) -> str | None:
-        # Lane mask (flat block, dim x). W=1: one warp per row.
+        # Lane mask (flat block, dim x). W>1 spans W*64 lanes/row -> full thread id.
+        if getattr(self, "_flydsl_warps_per_row", 1) > 1:
+            return f"fx.thread_idx.x < ({block_size_var})"
         return f"fx.thread_idx.x % 64 < ({block_size_var})"
 
     def lane_index_expr(
@@ -3709,7 +3734,9 @@ class FlyDSLBackend(Backend):
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
     ) -> str:
-        # Lane index (flat block, dim x). W=1: one warp per row.
+        # Lane index (flat block, dim x). W>1 spans W*64 lanes/row -> full thread id.
+        if getattr(self, "_flydsl_warps_per_row", 1) > 1:
+            return "fx.thread_idx.x"
         return "fx.thread_idx.x % 64"
 
     def reduction_index_zero_expr(self, dtype: str) -> str:
@@ -3905,9 +3932,34 @@ class FlyDSLBackend(Backend):
             return []
         self._flydsl_helpers_emitted = True
 
+        _WARP = 64
+        _NTHREADS = getattr(self, "_flydsl_num_threads", 256)
+        _SLOTS = max(1, _NTHREADS // _WARP)
+        _RESULT = _SLOTS  # result slot, disjoint from partial slots [0.._SLOTS-1]
+        _TOTAL = (
+            _SLOTS + 1
+        )  # partials + one result slot (mirrors CuTe's disjoint regions)
+
         stmts: list[ast.AST] = []
 
-        # warp reduce helpers (W=1: one warp per row, warp-shuffle only)
+        # shared memory struct for block reduce (used by W>1 helpers)
+        stmts.extend(
+            [
+                statement_from_string(
+                    f"""@fx.struct
+class _FlyDSLRedBuf:
+    s: fx.Array[fx.Float32, {_TOTAL}, 16]"""
+                ),
+                statement_from_string(
+                    "_flydsl_lds = fx.SharedAllocator().allocate(_FlyDSLRedBuf).peek()"
+                ),
+                statement_from_string(
+                    f"_flydsl_sred = _flydsl_lds.s.view(fx.make_layout({_TOTAL}, 1))"
+                ),
+            ]
+        )
+
+        # warp reduce helpers
         stmts += [
             statement_from_string(h)
             for h in [
@@ -3926,6 +3978,89 @@ class FlyDSLBackend(Backend):
     return w""",
             ]
         ]
+
+        # block reduce helpers (use shared memory, needed for W>1)
+        stmts.append(
+            statement_from_string(
+                f"""def _flydsl_bmax(w, _sred):
+    gpu.barrier()
+    _lane = fx.thread_idx.x % {_WARP}
+    _wave = fx.thread_idx.x // {_WARP}
+    _nwaves = fx.block_dim.x // {_WARP}
+    _r = _flydsl_wmax(w)
+    if _lane == 0:
+        fx.memref_store(_r, _sred, _wave)
+    gpu.barrier()
+    if _wave == 0:
+        _in = _lane < _nwaves
+        _ls = _in.select(_lane, 0)
+        _v = fx.memref_load(_sred, _ls)
+        _vv = _in.select(_v, fx.Float32(-3.4028235e+38))
+        _vv = _flydsl_wmax(_vv)
+
+        if _lane == 0:
+            fx.memref_store(_vv, _sred, {_RESULT})
+    gpu.barrier()
+
+    _out = fx.memref_load(_sred, {_RESULT})
+    gpu.barrier()
+    return _out"""
+            )
+        )
+        stmts.append(
+            statement_from_string(
+                f"""def _flydsl_bmin(w, _sred):
+    gpu.barrier()
+    _lane = fx.thread_idx.x % {_WARP}
+    _wave = fx.thread_idx.x // {_WARP}
+    _nwaves = fx.block_dim.x // {_WARP}
+    _r = _flydsl_wmin(w)
+    if _lane == 0:
+        fx.memref_store(_r, _sred, _wave)
+    gpu.barrier()
+    if _wave == 0:
+        _in = _lane < _nwaves
+        _ls = _in.select(_lane, 0)
+        _v = fx.memref_load(_sred, _ls)
+        _vv = _in.select(_v, fx.Float32(3.4028235e+38))
+        _vv = _flydsl_wmin(_vv)
+
+        if _lane == 0:
+            fx.memref_store(_vv, _sred, {_RESULT})
+    gpu.barrier()
+
+    _out = fx.memref_load(_sred, {_RESULT})
+    gpu.barrier()
+    return _out"""
+            )
+        )
+        stmts.append(
+            statement_from_string(
+                f"""def _flydsl_bsum(w, _sred):
+    gpu.barrier()
+    _lane = fx.thread_idx.x % {_WARP}
+    _wave = fx.thread_idx.x // {_WARP}
+    _nwaves = fx.block_dim.x // {_WARP}
+    _r = _flydsl_wsum(w)
+    if _lane == 0:
+        fx.memref_store(_r, _sred, _wave)
+    gpu.barrier()
+    if _wave == 0:
+        _in = _lane < _nwaves
+        _ls = _in.select(_lane, 0)
+        _v = fx.memref_load(_sred, _ls)
+        _vv = _in.select(_v, fx.Float32(0.0))
+        _vv = _flydsl_wsum(_vv)
+
+        if _lane == 0:
+            fx.memref_store(_vv, _sred, {_RESULT})
+    gpu.barrier()
+
+    _out = fx.memref_load(_sred, {_RESULT})
+    gpu.barrier()
+    return _out"""
+            )
+        )
 
         return stmts
 
@@ -3972,13 +4107,24 @@ class FlyDSLBackend(Backend):
         block_size_var: str | None = None,
         threads_in_group: int | None = None,
     ) -> str:
-        # W=1: one warp per row -> warp shuffle covers the whole row, no smem.
+        W = getattr(self, "_flydsl_warps_per_row", 1)
+        if W == 1:
+            # W=1: one warp per row -> warp shuffle covers the whole row, no smem.
+            if reduction_type == "sum":
+                return f"_flydsl_wsum({input_name}.reduce(ReductionOp.ADD, fastmath=arith.FastMathFlags.fast))"
+            if reduction_type == "max":
+                return f"_flydsl_wmax({input_name}.reduce(ReductionOp.MAX))"
+            if reduction_type == "min":
+                return f"_flydsl_wmin({input_name}.reduce(ReductionOp.MIN))"
+            raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+        # W>1: W warps cooperate on one row -> cross-warp block reduce via shared
+        # mem. Cast result to fp32 before smem store to avoid fp16 corruption.
         if reduction_type == "sum":
-            return f"_flydsl_wsum({input_name}.reduce(ReductionOp.ADD, fastmath=arith.FastMathFlags.fast))"
+            return f"_flydsl_bsum(({input_name}.reduce(ReductionOp.ADD, fastmath=arith.FastMathFlags.fast)).to(fx.Float32), _flydsl_sred)"
         if reduction_type == "max":
-            return f"_flydsl_wmax({input_name}.reduce(ReductionOp.MAX))"
+            return f"_flydsl_bmax(({input_name}.reduce(ReductionOp.MAX)).to(fx.Float32), _flydsl_sred)"
         if reduction_type == "min":
-            return f"_flydsl_wmin({input_name}.reduce(ReductionOp.MIN))"
+            return f"_flydsl_bmin(({input_name}.reduce(ReductionOp.MIN)).to(fx.Float32), _flydsl_sred)"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
     def reshape_expr(self, expr: str, shape: str) -> str:
