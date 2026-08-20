@@ -281,6 +281,32 @@ def _(state: CodegenState) -> None:
     tensor_name = state.device_function.tensor_arg(tensor).name
     use_buffer = getattr(backend, "_tensor_use_buffer", {}).get(id(tensor), False)
 
+    if use_buffer and tensor.ndim == 1:
+        # Rank-1 scalar store (e.g. inv_rms[tile_m] = per-row reduced scalar):
+        # one element per row, not a vectorized column store. Slicing a rank-1
+        # memref with a 2-tuple fails the flydsl profile check, so store the
+        # scalar directly at element ``idx_expr`` of the buffer. All 64 lanes
+        # hold the same reduced value and index, so the write is idempotent.
+        row_block_id = 0
+        for idx in subscript:
+            if isinstance(idx, torch.SymInt):
+                bid = env.get_block_id(idx)
+                if bid is not None:
+                    row_block_id = bid
+                    break
+        idx_expr = state.codegen.index_var(row_block_id)
+        buf = state.codegen.lift(
+            expr_from_string(f"fx.rocdl.make_buffer_tensor({tensor_name})"),
+            prefix="flydsl_buf",
+            dce=True,
+        )
+        state.add_statement(
+            statement_from_string(
+                f"fx.memref_store({{value}}, {buf.id}, {idx_expr})", value=value
+            )
+        )
+        return None
+
     if use_buffer:
         _info = _flydsl_buffer_setup(env, state, tensor, tensor_name, subscript)
         setup = _info["setup"]

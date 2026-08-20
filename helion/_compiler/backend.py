@@ -393,6 +393,39 @@ class Backend(abc.ABC):
         """
         return False
 
+    def looped_reduction_thread_count(
+        self,
+        *,
+        requested: int,
+        block_size: int,
+        block_index: int,
+        config: Config,
+        config_spec: ConfigSpec,
+    ) -> int | None:
+        """Backend override for the per-block thread count of a looped whole-row
+        reduction.
+
+        Return None to keep the default (``requested``). Tile-level backends
+        return None.
+        """
+        return None
+
+    def wrap_reduction_accumulator(
+        self,
+        acc_full: str,
+        *,
+        thread_count: int,
+        loop_block_size: int,
+        acc_dtype: torch.dtype,
+    ) -> str:
+        """Wrap the looped-reduction accumulator init expression, if needed.
+
+        FlyDSL's runtime scf.for carries the accumulator as an iter_arg whose init
+        type must match the per-thread vector the loop body yields, so it wraps
+        the scalar seed in ``fx.Vector.filled(...)``. Identity by default.
+        """
+        return acc_full
+
     def create_synthetic_reduction_lanes(
         self,
         thread_count: int,

@@ -1097,6 +1097,19 @@ class LoopedReductionStrategy(ReductionStrategy):
                 thread_count, tile_dispatch.strategies
             )
         self._thread_count = thread_count
+        if thread_count > 0:
+            # Thread-level backends (e.g. FlyDSL) may override the per-block thread
+            # count of a looped whole-row reduction; tile-level backends return
+            # None here and keep the default.
+            _override = env.backend.looped_reduction_thread_count(
+                requested=thread_count,
+                block_size=block_size,
+                block_index=block_index,
+                config=fn.config,
+                config_spec=env.config_spec,
+            )
+            if _override is not None:
+                self._thread_count = _override
         self.block_size = block_size
         self._loop_block_size = block_size
         self._cute_reduction_lane_var: str | None = None
@@ -1458,7 +1471,14 @@ class LoopedReductionStrategy(ReductionStrategy):
             assert isinstance(default, (float, int, bool))
             assert state.fx_node is not None
             acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
+
             acc_full = backend.full_expr(shape_dims, constant_repr(default), acc_dtype)
+            acc_full = backend.wrap_reduction_accumulator(
+                acc_full,
+                thread_count=self._thread_count,
+                loop_block_size=self._loop_block_size,
+                acc_dtype=acc_dtype,
+            )
             device_loop.outer_prefix.append(
                 statement_from_string(f"{acc} = {acc_full}")
             )
@@ -1558,6 +1578,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                         f"tl.static_assert({result}.dtype == {_dtype_str(fake_output.dtype)})"
                     )
                 )
+
             return expr_from_string(result)
 
 
