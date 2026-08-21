@@ -272,6 +272,62 @@ class TestFlydslReduction(TestCase):
         out = bk.compile_config(cfg)(x)
         torch.testing.assert_close(out, x.float().sum(-1), rtol=1e-3, atol=1e-3)
 
+    def test_constexpr_range_emits_and_correct(self) -> None:
+        # constexpr_range=True with a small tile count (N=1024, chunk=256 -> 4
+        # tiles <= 16) unrolls the reduction loop into range_constexpr, enabling
+        # in_local[] register caching (2-read HBM). Assert the unrolled form IS
+        # emitted AND the result is still correct.
+        code = self._rms(
+            8,
+            1024,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[256],
+            constexpr_range=True,
+        )
+        self.assertIn("range_constexpr(0, 1024", code)
+        self.assertNotIn("range(0, 1024", code)
+
+    def test_constexpr_softmax_correct(self) -> None:
+        # Whole-row softmax under constexpr_range (register-cached two passes).
+        code = self._softmax(
+            8,
+            1024,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[256],
+            constexpr_range=True,
+        )
+        self.assertIn("range_constexpr(0, 1024", code)
+
+    def test_constexpr_large_tile_count_falls_back(self) -> None:
+        # constexpr_range=True but tile count > 16 (N=16384, chunk=256 -> 64
+        # tiles) must fall back to the runtime scf.for (unrolling 64 tiles would
+        # blow up VGPRs), so range_constexpr is NOT emitted.
+        code = self._rms(
+            8,
+            16384,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[256],
+            constexpr_range=True,
+        )
+        self.assertNotIn("range_constexpr(0, 16384", code)
+        self.assertIn("range(0, 16384", code)
+
+    def test_autotune_offers_constexpr(self) -> None:
+        # autotune on a small-N rms_norm reaches the constexpr_range=True
+        # candidates without crashing and returns a valid, correct config.
+        x = torch.randn(8, 1024, device=DEVICE, dtype=torch.float16)
+        w = torch.randn(1024, device=DEVICE, dtype=torch.float16)
+        bk = rms_norm_fwd.bind((x, w, 1e-5))
+        cfg = bk.autotune((x, w, 1e-5), force=True)
+        self.assertIn("block_sizes", cfg.config)
+        out, _ = bk.compile_config(cfg)(x, w, 1e-5)
+        torch.testing.assert_close(
+            out.float(), ref_rms(x, w).float(), rtol=1e-2, atol=1e-2
+        )
+
 
 if __name__ == "__main__":
     import unittest

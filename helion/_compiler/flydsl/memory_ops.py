@@ -465,11 +465,108 @@ def _(state: CodegenState) -> ast.AST:
         else:
             chunk_idx = "fx.thread_idx.x"
 
-        # Explicit hl.tile(n) tail: N not a multiple of the per-pass span (4*64)
-        # -> the last chunk's high lanes would read past column N. The AMD buffer
-        # descriptor should return 0 for OOB reads but in practice still page-
-        # faults once the byte address crosses the tensor's allocation. Use
-        # guarded scalar loads so no access goes past the last valid column.
+        device_fn = state.device_function
+        _atom_name = setup["atom"]
+        _div_name = setup["div"]
+
+        # Register-caching via in_local[] pattern (2-read HBM):
+        # When constexpr_range is active, emit an empty Python list into outer_prefix
+        # and build it via .append() inside the reduce-loop body — exactly mirroring
+        # the reference FlyDSL kernel's in_local.append(vec) pattern.  FlyDSL's
+        # range_constexpr Python-executes the loop at trace time, so each
+        # cache.append(memref_load_vec(r)) adds a DISTINCT SSA value object.
+        # The normalize-loop reads cache[tile_idx] — a per-iteration SSA reference,
+        # not a new allocation.  This avoids the VGPR pressure of the list-comprehension
+        # approach (which created N make_rmem_tensor ops with long live ranges).
+        if (
+            is_rolled_col
+            and rolled_col_offset is not None
+            and getattr(backend, "_flydsl_use_constexpr_range", False)
+        ):
+            _cr_meta = getattr(device_fn, "_flydsl_cr_meta", {}).get(col_block_id)
+            # Only cache tensors that appeared in the reduce-loop graph (pre_codegen
+            # stored their FX node names in backend._flydsl_cr_reduce_tensors).
+            # This excludes weight/bias which appear only in the normalize-loop.
+            _fx_node_name = getattr(state.fx_node, "args", [None])[0]
+            _fx_node_name = getattr(_fx_node_name, "name", None)
+            _is_reduce_tensor = _fx_node_name is not None and _fx_node_name in getattr(
+                backend, "_flydsl_cr_reduce_tensors", set()
+            )
+            if _cr_meta is not None and _is_reduce_tensor:
+                _chunk, _num_tiles, _outer_prefix = _cr_meta
+                if not hasattr(device_fn, "_flydsl_cr_cache"):
+                    device_fn._flydsl_cr_cache = {}  # pyrefly: ignore[missing-attribute]
+                    device_fn._flydsl_cr_loaded = set()  # pyrefly: ignore[missing-attribute]
+                _cache_var = device_fn._flydsl_cr_cache.get(  # pyrefly: ignore[missing-attribute]
+                    tensor_name
+                )
+                if _cache_var is None:
+                    # First encounter: hoist an empty Python list into outer_prefix
+                    # (before the reduce-loop). range_constexpr will append SSA values
+                    # to it at trace time during the reduce-loop body.
+                    _cache_var = f"_cr_{tensor_name}_cache"
+                    device_fn._flydsl_cr_cache[tensor_name] = _cache_var  # pyrefly: ignore[missing-attribute]
+                    with state.codegen.set_statements(_outer_prefix):
+                        state.add_statement(statement_from_string(f"{_cache_var} = []"))
+                _tile_idx = f"({rolled_col_offset}) // {_chunk}"
+                if tensor_name not in device_fn._flydsl_cr_loaded:  # pyrefly: ignore[missing-attribute]
+                    # Write phase (reduce-loop): allocate per-iteration register,
+                    # load from HBM, append the loaded SSA value to the cache list.
+                    # Each range_constexpr iteration appends a distinct SSA object.
+                    device_fn._flydsl_cr_loaded.add(tensor_name)  # pyrefly: ignore[missing-attribute]
+                    _r_cr = f"_r_{tensor_name}_cr"
+                    state.add_statement(
+                        statement_from_string(
+                            f"{_r_cr} = fx.make_rmem_tensor({vec_width}, {dtype_str})"
+                        )
+                    )
+                    state.add_statement(
+                        statement_from_string(
+                            f"fx.copy_atom_call({_atom_name}, "
+                            f"fx.slice({_div_name}, (None, {chunk_idx})), {_r_cr})"
+                        )
+                    )
+                    _lv_cr = f"_lv_{tensor_name}_cr"
+                    state.add_statement(
+                        statement_from_string(f"{_lv_cr} = fx.memref_load_vec({_r_cr})")
+                    )
+                    # Append the SSA value to the cache — at trace time this
+                    # stores a distinct SSA object per unrolled iteration.
+                    state.add_statement(
+                        statement_from_string(f"{_cache_var}.append({_lv_cr})")
+                    )
+                    if rolled_col_pred is not None:
+                        return expr_from_string(
+                            f"({rolled_col_pred}).select({_lv_cr}, "
+                            f"fx.Vector.filled_like({_lv_cr}, 0))"
+                        )
+                    return expr_from_string(_lv_cr)
+                # Read phase (normalize-loop): read from cache — no HBM copy.
+                # Indexing invariant: cache[ti] was appended by iteration ti of the
+                # reduce-loop.  _tile_idx = (roffset) // chunk folds to ti (0,1,2,…)
+                # at each unrolled copy of range_constexpr(0, N, chunk), so
+                # cache[_tile_idx] correctly retrieves the reduce-loop's SSA value for
+                # the matching tile.  This holds for any vec_width V: chunk = BT*V,
+                # roffset = ti*chunk → roffset // chunk = ti regardless of V.
+                _lv_r = f"_lv_{tensor_name}_cr_r"
+                state.add_statement(
+                    statement_from_string(f"{_lv_r} = {_cache_var}[{_tile_idx}]")
+                )
+                if rolled_col_pred is not None:
+                    return expr_from_string(
+                        f"({rolled_col_pred}).select({_lv_r}, "
+                        f"fx.Vector.filled_like({_lv_r}, 0))"
+                    )
+                return expr_from_string(_lv_r)
+
+        # Explicit hl.tile(n) column tail: N not a multiple of the per-iteration
+        # span (4 * 64) -> the last chunk's high lanes would read past column N
+        # via the vectorized BufferCopy. The AMD buffer descriptor has max_size set
+        # to 0xFFFFFFFF which should return 0 for OOB reads, but in practice the
+        # hardware still fires a GPU page fault when the byte address exceeds the
+        # tensor's actual allocation (e.g. N=640, last tile reads cols 640-767 which
+        # falls one page past the end). Use guarded scalar loads instead so no
+        # memory access ever goes past the last valid column.
         _expl_tail = (
             is_vec
             and not is_rolled_col

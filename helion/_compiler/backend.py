@@ -426,6 +426,21 @@ class Backend(abc.ABC):
         """
         return acc_full
 
+    def record_reduction_loop_meta(
+        self,
+        state: object,
+        block_index: int,
+        numel: object,
+        device_loop_state: object,
+    ) -> None:
+        """Record per-block reduction-loop metadata after the device loop is built.
+
+        FlyDSL uses this to stash (chunk, num_tiles, outer_prefix) on the device
+        function so its load codegen can emit per-tile register-slot arrays when
+        the constexpr-range path is active. No-op by default.
+        """
+        return None
+
     def create_synthetic_reduction_lanes(
         self,
         thread_count: int,
