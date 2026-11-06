@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 class _ThreadLevel64Backend(MetalBackend):
     # A thread-level backend whose reductions use at most 64 threads (one AMD
-    # wavefront); stands in for FlyDSL so this test does not import it.
+    # wavefront), like the out-of-tree FlyDSL backend.
     @property
     def name(self) -> str:
         return "_test_thread_level_64"

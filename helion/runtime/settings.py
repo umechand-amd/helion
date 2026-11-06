@@ -22,6 +22,7 @@ from torch._environment import is_fbcode
 from .. import exc
 from .._compat import is_hip
 from .._compat import supports_tf32_precision_on_amd
+from .._compiler.backend_registry import install_hint
 from .._compiler.backend_registry import list_backends
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import InitialPopulation
@@ -375,11 +376,17 @@ def _get_dot_precision() -> DotPrecision:
 
 
 def _get_backend() -> str:
-    return _env_get_literal(
-        "HELION_BACKEND",
-        "triton",
-        mapping={name: name for name in list_backends()},
-    )
+    try:
+        return _env_get_literal(
+            "HELION_BACKEND",
+            "triton",
+            mapping={name: name for name in list_backends()},
+        )
+    except ValueError as e:
+        hint = install_hint(os.environ.get("HELION_BACKEND", "").strip())
+        if hint:
+            raise ValueError(f"{e}{hint}") from None
+        raise
 
 
 def is_pallas_interpret() -> bool:

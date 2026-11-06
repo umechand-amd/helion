@@ -300,6 +300,13 @@ export ENABLE_TILE=1
 
 For detailed documentation, see the [TileIR Backend Guide](docs/tileir_backend.md).
 
+## Out-of-tree Backends
+
+Backends can ship as separate packages that Helion discovers through the
+`helion.backends` entry point (see `docs/api/backend_api.md`). The FlyDSL
+(AMD ROCm) backend is one: `pip install helion-flydsl`, then select it with
+`HELION_BACKEND=flydsl` or `@helion.kernel(backend="flydsl")`.
+
 ## CuTe Backend (CUDA 13+)
 
 Helion has a beta [CUTLASS CuTe DSL](https://github.com/NVIDIA/cutlass) backend that lowers kernels through CuTe instead of Triton.
