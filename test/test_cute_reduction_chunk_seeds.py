@@ -12,7 +12,7 @@ from helion._compiler.autotuner_heuristics.cute import CuteReductionWideChunkHeu
 from helion._compiler.autotuner_heuristics.cute import CuteRolledClusterLadderHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteRolledRowLadderHeuristic
 from helion._compiler.backend import CuteBackend
-from helion._compiler.flydsl.backend import FlyDSLBackend
+from helion._compiler.backend import TritonBackend
 from helion._testing import DEVICE
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -196,6 +196,19 @@ def test_indexed_reduction_keeps_warp_cap_without_backend_loop_cap(
     assert config.reduction_loops == [32]
 
 
+class _CappedReductionBackend(TritonBackend):
+    # A non-CuTe backend with its own reduction thread and loop caps.
+    @property
+    def name(self) -> str:
+        return "_test_capped_reduction"
+
+    def max_reduction_threads(self) -> int | None:
+        return 64
+
+    def max_reduction_loop(self) -> int | None:
+        return 8192
+
+
 @pytest.mark.parametrize(
     ("chunk", "expected_seed", "expected_direct"),
     [
@@ -209,7 +222,7 @@ def test_other_backend_reduction_seed_policy_is_preserved(
     expected_seed: int | None,
     expected_direct: int,
 ) -> None:
-    spec = ConfigSpec(backend=FlyDSLBackend())
+    spec = ConfigSpec(backend=_CappedReductionBackend())
     spec.reduction_loops.append(ReductionLoopSpec(block_id=0, size_hint=32768))
     seed = Config(reduction_loops=[chunk])
     spec.compiler_seed_configs = [seed]

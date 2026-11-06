@@ -141,7 +141,11 @@ other attributes of the classes listed here, may change without notice.
 5. **Sympy helper.** `symint_sympy_expr(x)` returns the `sympy.Expr` behind a
    `torch.SymInt`; its signature (takes a SymInt, returns `sympy.Expr`) is
    covered, which is all codegen sites rely on.
-6. **Plugin contract.** The `helion.backends` entry-point group, the rule that
+6. **Per-function state.** `DeviceFunction.backend_codegen_state`, a dict for
+   codegen state shared across a backend's op handlers while one device
+   function is generated. Use your backend's name as the key; the value is
+   yours.
+7. **Plugin contract.** The `helion.backends` entry-point group, the rule that
    an entry point is named after its backend, the
    `HELION_BACKEND_API_VERSION` class attribute, and the
    `<package>._codegen_modules` convention, as described above.
