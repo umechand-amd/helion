@@ -25,6 +25,7 @@ from ..runtime.config import Config
 from ..runtime.cute_structural_config import bound_structural_policy
 from ..runtime.cute_structural_config import decode_structural_policy
 from ..runtime.cute_structural_config import require_same_structural_policy
+from .base_cache import _OMITTED_WHEN_EMPTY_KEY_FIELDS
 from .base_cache import AutotuneCacheBase
 from .base_cache import LooseAutotuneCacheKey
 from .base_cache import StrictAutotuneCacheKey
@@ -322,6 +323,13 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 getattr(self.kernel.config_spec, "cute_flash_search_enabled", False)
             ),
         )
+        backend = self.kernel.env.backend
+        backend_autotune_key = backend.autotune_cache_key()
+        if not isinstance(backend_autotune_key, str):
+            raise TypeError(
+                f"{type(backend).__qualname__}.autotune_cache_key() must return "
+                f"str, got {type(backend_autotune_key).__name__}"
+            )
         return LooseAutotuneCacheKey(
             specialization_key=specialization_key,
             extra_results=extra_results,
@@ -329,11 +337,12 @@ class LocalAutotuneCache(AutotuneCacheBase):
             kernel_source_hash=kernel_source_hash,
             hardware=hardware,
             runtime_name=runtime_name,
-            backend=self.kernel.env.backend.name,
+            backend=backend.name,
             config_spec_hash=config_spec_hash,
             extra_cache_key=self.kernel.extra_cache_key(),
             best_of_k=self.autotuner.settings.autotune_best_of_k,
             search_policy_hash=search_policy_hash,
+            backend_autotune_key=backend_autotune_key,
         )
 
     def _get_local_cache_path(self) -> Path:
@@ -374,7 +383,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
             "fields": {
                 k: str(v)
                 for k, v in vars(self.key).items()
-                if k != "search_policy_hash" or v
+                if k not in _OMITTED_WHEN_EMPTY_KEY_FIELDS or v
             },
         }
 

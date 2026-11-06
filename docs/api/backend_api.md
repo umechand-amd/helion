@@ -114,6 +114,10 @@ other attributes of the classes listed here, may change without notice.
    reuses a built-in key or a key of a registered backend that is neither
    its subclass nor its base, so sibling subclasses of one base clash),
    `tunable_fragments`,
+   `autotune_cache_key` (return a `str`, e.g. the plugin's package version,
+   identical across processes and hosts, so an upgrade misses the local and
+   remote best-config caches; a non-`str` raises `TypeError` and an exception
+   it raises propagates; warm-start seeds and the AOT cache ignore it),
    `supports_precompile`, `adjust_block_size_constraints`, `autotune`,
    `get_do_bench`, `get_interleaved_bench`.
    The autotuner times candidates with `get_do_bench()` (single config) and

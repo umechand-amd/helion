@@ -164,6 +164,9 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
         hashes stay byte-identical to entries written before this field existed.
     search_policy_hash: Hash of the effective CuTe-flash search policy. Empty
         for every other search so their historical cache hashes stay unchanged.
+    backend_autotune_key: ``Backend.autotune_cache_key()``, e.g. an
+        out-of-tree backend's package version. Empty (and hidden from ``repr``)
+        for built-in backends so their historical hashes stay unchanged.
     """
 
     kernel_source_hash: str
@@ -177,6 +180,7 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
     # K=1 hash matches historical bytes exactly.
     best_of_k: int = dataclasses.field(default=1, repr=False)
     search_policy_hash: str = dataclasses.field(default="", repr=False)
+    backend_autotune_key: str = dataclasses.field(default="", repr=False)
 
     def __repr__(self) -> str:
         # Append ``best_of_k`` only when it is non-default. ``_repr_body`` does
@@ -187,7 +191,13 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
             body = f"{body}, best_of_k={self.best_of_k!r}"
         if self.search_policy_hash:
             body = f"{body}, search_policy_hash={self.search_policy_hash!r}"
+        if self.backend_autotune_key:
+            body = f"{body}, backend_autotune_key={self.backend_autotune_key!r}"
         return f"{type(self).__name__}({body})"
+
+
+# LooseAutotuneCacheKey fields that put() leaves out of cache files when empty.
+_OMITTED_WHEN_EMPTY_KEY_FIELDS = ("search_policy_hash", "backend_autotune_key")
 
 
 @dataclasses.dataclass(frozen=True, repr=False)
@@ -350,7 +360,14 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
                     has_diff = False
                     for field_name in vars(current_key):
                         current_val = str(getattr(current_key, field_name))
-                        cached_val = str(getattr(cached_key, field_name, "<missing>"))
+                        # put() omits these fields when empty.
+                        missing = (
+                            ""
+                            if current_val == ""
+                            and field_name in _OMITTED_WHEN_EMPTY_KEY_FIELDS
+                            else "<missing>"
+                        )
+                        cached_val = str(getattr(cached_key, field_name, missing))
                         if current_val != cached_val:
                             has_diff = True
                             print(f"    {field_name}:", file=sys.stderr)

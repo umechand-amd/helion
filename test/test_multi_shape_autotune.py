@@ -237,6 +237,9 @@ class _RuntimeBackend:
     def make_ephemeral_cache(self) -> contextlib.AbstractContextManager[None]:
         return contextlib.nullcontext()
 
+    def autotune_cache_key(self) -> str:
+        return ""
+
     def autotune(
         self, bound_kernel: object, args: object, *, force: bool, **options: object
     ) -> Config:

@@ -665,6 +665,20 @@ class Backend(abc.ABC):
 
         return DEFAULT_NUM_SM_MULTIPLIER
 
+    def autotune_cache_key(self) -> str:
+        """Extra component of the autotune cache key, e.g. a package version.
+
+        A changed value makes the exact-match autotune caches (local and
+        remote best-config entries) miss, so an upgraded out-of-tree backend
+        re-tunes.  Best-available warm-start seeds and the AOT cache do not
+        use it.  The value must be identical across processes and hosts (the
+        remote cache shares keys) and cheap to compute (it is read whenever a
+        cache key is built).  It must return a ``str`` (anything else raises
+        ``TypeError``); an exception it raises propagates, so autotuning with a
+        cache fails.  The default ``""`` leaves keys unchanged.
+        """
+        return ""
+
     def cross_loop_pipelines(self) -> tuple[str, ...]:
         """``cross_loop_pipeline`` values this backend can lower.
 
